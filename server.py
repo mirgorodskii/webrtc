@@ -2,9 +2,12 @@ import asyncio
 import websockets
 import json
 import os
+import time
 
 td_connection = None
-viewers = {}  # Теперь словарь с timestamp последнего heartbeat
+viewers = {}  # {websocket: {'started': timestamp, 'active': bool}}
+
+VIEWER_TIMEOUT = 60  # 60 секунд просмотра
 
 async def handler(websocket, path):
     global td_connection
@@ -16,53 +19,61 @@ async def handler(websocket, path):
             if data['type'] == 'td-sender':
                 td_connection = websocket
                 print('TouchDesigner connected')
-                # Сразу говорим сколько viewers
                 await websocket.send(json.dumps({
                     'type': 'viewer_count',
-                    'count': len(viewers)
+                    'count': sum(1 for v in viewers.values() if v['active'])
                 }))
                 
-            elif data['type'] == 'viewer':
-                viewers[websocket] = asyncio.get_event_loop().time()
-                print(f'Viewer connected. Total: {len(viewers)}')
+            elif data['type'] == 'viewer_start':
+                # Запускаем или перезапускаем viewer
+                viewers[websocket] = {
+                    'started': time.time(),
+                    'active': True
+                }
+                print(f'Viewer started. Total active: {sum(1 for v in viewers.values() if v["active"])}')
                 
-                # Уведомляем TD что появился viewer
+                # Уведомляем TD
                 if td_connection:
                     try:
                         await td_connection.send(json.dumps({
                             'type': 'viewer_count',
-                            'count': len(viewers)
+                            'count': sum(1 for v in viewers.values() if v['active'])
                         }))
                     except:
                         pass
+                
+                # Отправляем клиенту подтверждение
+                await websocket.send(json.dumps({
+                    'type': 'streaming_started',
+                    'duration': VIEWER_TIMEOUT
+                }))
                         
             elif data['type'] == 'heartbeat':
-                # Обновляем timestamp viewer
+                # Обновляем heartbeat
                 if websocket in viewers:
-                    viewers[websocket] = asyncio.get_event_loop().time()
+                    viewers[websocket]['last_heartbeat'] = time.time()
                 
             elif data['type'] == 'frame' and websocket == td_connection:
-                # Отправляем только если есть viewers
+                # Отправляем только активным viewers
                 if viewers:
-                    dead_viewers = set()
-                    for viewer in list(viewers.keys()):
-                        try:
-                            await viewer.send(message)
-                        except:
-                            dead_viewers.add(viewer)
+                    dead_viewers = []
+                    for viewer, info in list(viewers.items()):
+                        if info['active']:
+                            try:
+                                await viewer.send(message)
+                            except:
+                                dead_viewers.append(viewer)
                     
                     # Удаляем мертвые viewers
                     for dead in dead_viewers:
                         if dead in viewers:
                             del viewers[dead]
-                            print(f'Viewer died. Total: {len(viewers)}')
                     
-                    # Уведомляем TD если изменилось количество
                     if dead_viewers and td_connection:
                         try:
                             await td_connection.send(json.dumps({
                                 'type': 'viewer_count',
-                                'count': len(viewers)
+                                'count': sum(1 for v in viewers.values() if v['active'])
                             }))
                         except:
                             pass
@@ -72,12 +83,11 @@ async def handler(websocket, path):
             del viewers[websocket]
             print(f'Viewer disconnected. Total: {len(viewers)}')
             
-            # Уведомляем TD что viewer ушел
             if td_connection:
                 try:
                     await td_connection.send(json.dumps({
                         'type': 'viewer_count',
-                        'count': len(viewers)
+                        'count': sum(1 for v in viewers.values() if v['active'])
                     }))
                 except:
                     pass
@@ -86,32 +96,39 @@ async def handler(websocket, path):
             td_connection = None
             print('TouchDesigner disconnected')
 
-# Фоновая задача для очистки мертвых viewers
-async def cleanup_dead_viewers():
+# Фоновая задача для проверки таймаутов
+async def check_viewer_timeouts():
     global td_connection
     while True:
-        await asyncio.sleep(5)  # Проверяем каждые 5 секунд
+        await asyncio.sleep(2)  # Проверяем каждые 2 секунды
         
-        current_time = asyncio.get_event_loop().time()
-        dead_viewers = []
+        current_time = time.time()
+        expired_viewers = []
         
-        for viewer, last_seen in list(viewers.items()):
-            # Если viewer не откликался 10 секунд - считаем мертвым
-            if current_time - last_seen > 10:
-                dead_viewers.append(viewer)
+        for viewer, info in list(viewers.items()):
+            if info['active'] and (current_time - info['started']) > VIEWER_TIMEOUT:
+                expired_viewers.append(viewer)
         
-        if dead_viewers:
-            for dead in dead_viewers:
-                if dead in viewers:
-                    del viewers[dead]
-                    print(f'Viewer timeout. Total: {len(viewers)}')
+        if expired_viewers:
+            for viewer in expired_viewers:
+                if viewer in viewers:
+                    viewers[viewer]['active'] = False
+                    print(f'Viewer time expired. Active: {sum(1 for v in viewers.values() if v["active"])}')
+                    
+                    # Уведомляем viewer что время вышло
+                    try:
+                        await viewer.send(json.dumps({
+                            'type': 'time_expired'
+                        }))
+                    except:
+                        pass
             
             # Уведомляем TD
             if td_connection:
                 try:
                     await td_connection.send(json.dumps({
                         'type': 'viewer_count',
-                        'count': len(viewers)
+                        'count': sum(1 for v in viewers.values() if v['active'])
                     }))
                 except:
                     pass
@@ -119,8 +136,8 @@ async def cleanup_dead_viewers():
 async def main():
     port = int(os.environ.get('PORT', 8080))
     
-    # Запускаем cleanup в фоне
-    cleanup_task = asyncio.create_task(cleanup_dead_viewers())
+    # Запускаем проверку таймаутов
+    timeout_task = asyncio.create_task(check_viewer_timeouts())
     
     async with websockets.serve(handler, '0.0.0.0', port):
         print(f'WebSocket server running on port {port}')
