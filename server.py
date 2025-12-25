@@ -7,7 +7,7 @@ import time
 td_connection = None
 viewers = {}  # {websocket: {'started': timestamp, 'active': bool}}
 
-VIEWER_TIMEOUT = 60  # 60 секунд просмотра
+VIEWER_TIMEOUT = 300  # 300 секунд просмотра
 
 async def handler(websocket, path):
     global td_connection
@@ -145,3 +145,4 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
